@@ -1,5 +1,5 @@
 //@version=6
-indicator("Smart Money Triple Confirmation V2", "SMTC V2", overlay = true, scale = scale.none, max_lines_count = 300, max_labels_count = 400, max_boxes_count = 100, max_bars_back = 2000)
+indicator("Smart Money Triple Confirmation V2", "SMTC V2", overlay = true, scale = scale.none, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 2000)
 
 // All event processing is gated by barstate.isconfirmed. Default thresholds
 // are V2's requested values in Custom mode; presets are documented.
@@ -33,8 +33,8 @@ int minGapTicks = input.int(1, "Additional minimum FVG ticks", minval = 1, group
 int fvgWindowInput = input.int(2, "MSS → FVG confirmation / impulse window", minval = 1, maxval = 10, group = GF)
 bool sameBarFvg = input.bool(true, "Allow FVG confirmation on MSS candle", group = GF)
 int retestWindowInput = input.int(15, "FVG → retest maximum bars", minval = 1, maxval = 100, group = GF)
-bool removeFullZones = input.bool(true, "Remove fully mitigated zones", group = GF)
-int maxZones = input.int(20, "Maximum visible FVG zones", minval = 1, maxval = 40, group = GF)
+bool removeFullZones = input.bool(false, "Compact mode: remove fully mitigated zones", group = GF)
+int maxZones = input.int(500, "Maximum retained FVG drawings (platform cap)", minval = 1, maxval = 500, group = GF)
 string signalMode = input.string("Conservative", "Signal mode (both require later retest)", options = ["Conservative", "Aggressive"], group = GC)
 float rejectionWickBody = input.float(0.25, "Rejection wick / body minimum", minval = 0, step = 0.05, group = GC)
 float rejectionWickAtr = input.float(0.03, "Rejection wick / ATR minimum", minval = 0, step = 0.01, group = GC)
@@ -63,6 +63,7 @@ float tp1Rr = input.float(1.0, "TP1 R (omitted if not before TP2)", minval = 0.1
 bool rrFilter = input.bool(true, "Enforce minimum TP2 R", group = GR)
 float minRr = input.float(2.0, "Minimum TP2 R", minval = 0.1, step = 0.1, group = GR)
 int tradeMonitorBars = input.int(100, "Maximum live-entry status age", minval = 1, maxval = 500, group = GR)
+bool preserveHistory = input.bool(true, "Preserve full loaded signal history", group = GV, tooltip = "Keep all plotted entry/confirmation markers on loaded bars. Retain expired/mitigated FVGs and price lines until the drawing limits are reached. Overrides compact group retention and automatic zone removal, not trading expiry.")
 bool debug = input.bool(false, "Debug: pending / all confirmed sweeps and failures", group = GV)
 bool showSweeps = input.bool(true, "Sweep markers (external + MSS by default)", group = GV)
 bool showLiquidity = input.bool(true, "Swept level lines", group = GV)
@@ -74,8 +75,8 @@ bool showEntryLine = input.bool(true, "Entry price level", group = GV)
 bool showSl = input.bool(true, "SL level", group = GV)
 bool showTp = input.bool(true, "TP1 / TP2 levels", group = GV)
 bool showDashboard = input.bool(true, "Dashboard", group = GV)
-int historyLimit = input.int(10, "Maximum recent completed entry setups", minval = 1, maxval = 30, group = GV)
-int failedHistoryLimit = input.int(3, "Maximum incomplete / debug groups", minval = 1, maxval = 20, group = GV)
+int historyLimit = input.int(10, "Compact mode: recent completed entry drawings", minval = 1, maxval = 30, group = GV)
+int failedHistoryLimit = input.int(3, "Compact mode: incomplete / debug groups", minval = 1, maxval = 20, group = GV)
 int riskLineBars = input.int(20, "Risk level line length", minval = 1, maxval = 200, group = GV)
 string dashboardTimezone = input.string("Etc/UTC", "Dashboard timestamp timezone", group = GV)
 bool sweepAlerts = input.bool(true, "Sweep alerts (including hidden sweeps)", group = GA)
@@ -283,17 +284,30 @@ type View
     int born = na
     bool full = false
     bool partial = false
+    bool zoneExpired = false
     bool finished = false
     bool completed = false
     int finishedBar = na
 var array<View> views = array.new<View>()
+// Drawing IDs are bounded by platform capacity, independently of plots.
+var array<View> retainedZones = array.new<View>()
+var array<line> retainedLines = array.new<line>()
+var array<label> retainedLabels = array.new<label>()
 f_label(View v, float price, string caption, color shade, bool large) =>
+    if preserveHistory and array.size(retainedLabels) >= 500
+        label.delete(array.shift(retainedLabels))
     label item = label.new(bar_index, price, caption, xloc = xloc.bar_index, yloc = yloc.price, style = v.direction == 1 ? label.style_label_up : label.style_label_down, color = shade, textcolor = color.white, size = large ? size.normal : size.tiny)
     array.push(v.labels, item)
+    if preserveHistory
+        array.push(retainedLabels, item)
     item
 f_line(View v, int start, float price, int finish, color shade, string style) =>
+    if preserveHistory and array.size(retainedLines) >= 500
+        line.delete(array.shift(retainedLines))
     line item = line.new(math.max(start, bar_index - 1900), price, finish, price, xloc = xloc.bar_index, color = shade, style = style)
     array.push(v.lines, item)
+    if preserveHistory
+        array.push(retainedLines, item)
     item
 f_deleteView(View v) =>
     if array.size(v.labels) > 0
@@ -388,6 +402,14 @@ bool bullMss = false
 bool bearMss = false
 bool bullTriple = false
 bool bearTriple = false
+bool bullPending = false
+bool bearPending = false
+bool bullSweepRevealed = false
+bool bearSweepRevealed = false
+bool bullChoch = false
+bool bearChoch = false
+float bullBreakPrice = na
+float bearBreakPrice = na
 bool buy = false
 bool sell = false
 array<bool> proposed = array.from(false, false)
@@ -442,18 +464,24 @@ if barstate.isconfirmed
             lastTrade.status := "Historical"
             lastTrade.outcome := "Monitoring expired"
 
-    // Update zone visualization independently of entry eligibility.
+    // Expiry/mitigation still disable trading. In full-history mode they
+    // freeze/fade the rectangle rather than deleting its historical evidence.
     if array.size(views) > 0
         for v in views
-            if not na(v.gap) and bar_index > v.born
-                bool fullNow = v.direction == 1 ? low <= v.bottom : high >= v.top
-                bool touched = low <= v.top and high >= v.bottom
-                v.partial := v.partial or touched
-                v.full := v.full or fullNow
-                if not v.full
-                    box.set_right(v.gap, bar_index)
-                box.set_bgcolor(v.gap, color.new(v.direction == 1 ? color.blue : color.orange, v.full ? 94 : v.partial ? 88 : 82))
-                if bar_index - v.born > retestWindow or (v.full and removeFullZones)
+            if not na(v.gap) and bar_index > v.born and not v.zoneExpired and (not v.full or not preserveHistory)
+                bool expired = bar_index - v.born > retestWindow
+                if expired
+                    v.zoneExpired := true
+                else
+                    bool fullNow = v.direction == 1 ? low <= v.bottom : high >= v.top
+                    bool touched = low <= v.top and high >= v.bottom
+                    v.partial := v.partial or touched
+                    bool wasFull = v.full
+                    v.full := v.full or fullNow
+                    if not wasFull
+                        box.set_right(v.gap, bar_index)
+                box.set_bgcolor(v.gap, v.zoneExpired ? color.new(color.gray, 90) : color.new(v.direction == 1 ? color.blue : color.orange, v.full ? 94 : v.partial ? 88 : 82))
+                if not preserveHistory and (expired or (v.full and removeFullZones))
                     box.delete(v.gap)
                     v.gap := na
 
@@ -507,7 +535,9 @@ if barstate.isconfirmed
             s.extreme := d == 1 ? low : high
             array.set(setups, side, s)
             f_record(s.id, "SWEEP_PENDING", s.pool.price)
-            if debug
+            bullPending := bullPending or d == 1
+            bearPending := bearPending or d == -1
+            if debug and showSweeps and not preserveHistory
                 s.pendingMarker := f_label(v, d == 1 ? low : high, "Pending #" + str.tostring(s.id), color.gray, false)
         if s.stage >= SWEEP_PENDING and s.stage <= WAITING_RETEST
             int oldStage = s.stage
@@ -567,7 +597,8 @@ if barstate.isconfirmed
                     label.delete(s.pendingMarker)
                     s.pendingMarker := na
                 if debug and showSweeps
-                    f_label(s.view, d == 1 ? low : high, (d == 1 ? "SSL" : "BSL") + " #" + str.tostring(s.id) + " " + s.pool.source, shade, false)
+                    if not preserveHistory
+                        f_label(s.view, d == 1 ? low : high, (d == 1 ? "SSL" : "BSL") + " #" + str.tostring(s.id) + " " + s.pool.source, shade, false)
                     s.sweepDrawn := true
                     if showLiquidity
                         f_line(s.view, s.pool.origin, s.pool.price, bar_index, shade, line.style_dotted)
@@ -580,16 +611,26 @@ if barstate.isconfirmed
                 bool choch = s.trend == -d and not na(s.externalReference) and d * (close - s.externalReference) > 0 and d * (close[1] - s.externalReference) <= 0
                 bullMss := bullMss or d == 1
                 bearMss := bearMss or d == -1
+                bullChoch := bullChoch or (d == 1 and choch)
+                bearChoch := bearChoch or (d == -1 and choch)
+                if d == 1
+                    bullBreakPrice := s.reference
+                else
+                    bearBreakPrice := s.reference
                 f_record(s.id, choch ? "CHoCH" : "MSS_CONFIRMED", s.reference)
                 // Default reveal occurs NOW, at MSS detection, not backdated
                 // to the prior sweep bar. The immutable ledger retains both.
                 if showSweeps and not s.sweepDrawn and s.pool.rank >= 2
-                    f_label(s.view, d == 1 ? low : high, (d == 1 ? "SSL → MSS" : "BSL → MSS") + " #" + str.tostring(s.id), shade, false)
+                    bullSweepRevealed := bullSweepRevealed or d == 1
+                    bearSweepRevealed := bearSweepRevealed or d == -1
+                    if not preserveHistory
+                        f_label(s.view, d == 1 ? low : high, (d == 1 ? "SSL → MSS" : "BSL → MSS") + " #" + str.tostring(s.id), shade, false)
                     s.sweepDrawn := true
                     if showLiquidity
                         f_line(s.view, s.pool.origin, s.pool.price, bar_index, shade, line.style_dotted)
                 if showMss
-                    f_label(s.view, s.reference, (choch ? "CHoCH" : "MSS") + " #" + str.tostring(s.id), shade, false)
+                    if not preserveHistory
+                        f_label(s.view, s.reference, (choch ? "CHoCH" : "MSS") + " #" + str.tostring(s.id), shade, false)
                     f_line(s.view, s.referenceOrigin, s.reference, bar_index, shade, line.style_solid)
             if formed
                 s.top := d == 1 ? low : low[2]
@@ -603,8 +644,15 @@ if barstate.isconfirmed
                 bullTriple := bullTriple or d == 1
                 bearTriple := bearTriple or d == -1
                 if showFvg
+                    if preserveHistory and array.size(retainedZones) >= maxZones
+                        View oldestZone = array.shift(retainedZones)
+                        if not na(oldestZone.gap)
+                            box.delete(oldestZone.gap)
+                            oldestZone.gap := na
                     s.view.gap := box.new(bar_index - 2, s.top, bar_index, s.bottom, border_color = color.new(d == 1 ? color.blue : color.orange, 30), bgcolor = color.new(d == 1 ? color.blue : color.orange, 82))
-                if showTriple
+                    if preserveHistory
+                        array.push(retainedZones, s.view)
+                if showTriple and not preserveHistory
                     f_label(s.view, d == 1 ? low : high, "Triple #" + str.tostring(s.id), color.new(shade, 30), false)
             if entry
                 array.set(proposed, side, true)
@@ -645,8 +693,6 @@ if barstate.isconfirmed
                 lastTrade := Trade.new(s.id, d, bar_index, time_close, close, array.get(stops, side), array.get(tp1s, side), array.get(targets, side), barstate.isrealtime, barstate.isrealtime ? "Active" : "Historical", "Open")
                 f_record(s.id, "ENTRY_CONFIRMED", close)
                 color shade = d == 1 ? color.green : color.red
-                if showEntries
-                    f_label(s.view, d == 1 ? low : high, (d == 1 ? "BUY #" : "SELL #") + str.tostring(s.id), shade, true)
                 if showEntryLine
                     f_line(s.view, bar_index, lastTrade.entry, bar_index + riskLineBars, color.silver, line.style_solid)
                 if showSl
@@ -689,45 +735,73 @@ if barstate.isconfirmed
         if inside
             array.set(sessionKeys, sessionIndex, key)
 
-    // Completed entries and incomplete attempts have separate budgets.
-    // Evict by FINISH time, not start time, so a long-waiting setup that
-    // just entered cannot be mistaken for an older completed trade.
-    int emptyIndex = 0
-    while emptyIndex < array.size(views)
-        View v = array.get(views, emptyIndex)
-        bool emptyFailed = v.finished and not v.completed and not debug and array.size(v.labels) == 0 and array.size(v.lines) == 0 and na(v.gap)
-        if emptyFailed
-            array.remove(views, emptyIndex)
-        else
-            emptyIndex += 1
-    for category = 0 to 1
-        bool completed = category == 0
-        int limit = completed ? historyLimit : failedHistoryLimit
-        int count = 0
-        for v in views
-            count += v.finished and v.completed == completed ? 1 : 0
-        while count > limit
-            int oldestIndex = -1
-            int oldestBar = na
-            for index = 0 to array.size(views) - 1
-                View v = array.get(views, index)
-                if v.finished and v.completed == completed and (na(oldestBar) or v.finishedBar < oldestBar)
-                    oldestIndex := index
-                    oldestBar := v.finishedBar
-            if oldestIndex >= 0
-                f_deleteView(array.get(views, oldestIndex))
-                array.remove(views, oldestIndex)
-                count -= 1
+    if preserveHistory
+        int cleanupIndex = 0
+        while cleanupIndex < array.size(views)
+            View v = array.get(views, cleanupIndex)
+            bool doneUpdating = v.finished and (na(v.gap) or v.full or v.zoneExpired)
+            if doneUpdating
+                // Forget processing metadata without deleting chart objects.
+                array.remove(views, cleanupIndex)
             else
-                break
-    int boxCount = 0
-    for v in views
-        boxCount += not na(v.gap) ? 1 : 0
-    for v in views
-        if boxCount > maxZones and not na(v.gap)
-            box.delete(v.gap)
-            v.gap := na
-            boxCount -= 1
+                cleanupIndex += 1
+    else
+        // Completed entries and incomplete attempts have separate budgets.
+        // Evict by FINISH time, not start time, so a long-waiting setup that
+        // just entered cannot be mistaken for an older completed trade.
+        int emptyIndex = 0
+        while emptyIndex < array.size(views)
+            View v = array.get(views, emptyIndex)
+            bool emptyFailed = v.finished and not v.completed and not debug and array.size(v.labels) == 0 and array.size(v.lines) == 0 and na(v.gap)
+            if emptyFailed
+                array.remove(views, emptyIndex)
+            else
+                emptyIndex += 1
+        for category = 0 to 1
+            bool completed = category == 0
+            int limit = completed ? historyLimit : failedHistoryLimit
+            int count = 0
+            for v in views
+                count += v.finished and v.completed == completed ? 1 : 0
+            while count > limit
+                int oldestIndex = -1
+                int oldestBar = na
+                for index = 0 to array.size(views) - 1
+                    View v = array.get(views, index)
+                    if v.finished and v.completed == completed and (na(oldestBar) or v.finishedBar < oldestBar)
+                        oldestIndex := index
+                        oldestBar := v.finishedBar
+                if oldestIndex >= 0
+                    f_deleteView(array.get(views, oldestIndex))
+                    array.remove(views, oldestIndex)
+                    count -= 1
+                else
+                    break
+        int boxCount = 0
+        for v in views
+            boxCount += not na(v.gap) ? 1 : 0
+        for v in views
+            if boxCount > maxZones and not na(v.gap)
+                box.delete(v.gap)
+                v.gap := na
+                boxCount -= 1
+
+// Historical markers are plots, not drawing objects. TradingView retains
+// them on all loaded chart bars; object queues cannot erase these signals.
+plotshape(showEntries and buy ? low : na, "BUY history", shape.labelup, location.absolute, color.green, text = "BUY", textcolor = color.white, size = size.normal)
+plotshape(showEntries and sell ? high : na, "SELL history", shape.labeldown, location.absolute, color.red, text = "SELL", textcolor = color.white, size = size.normal)
+plotshape(preserveHistory and showSweeps and debug and bullPending and not bullSweep ? low : na, "Pending SSL history", shape.labelup, location.absolute, color.gray, text = "Pending", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showSweeps and debug and bearPending and not bearSweep ? high : na, "Pending BSL history", shape.labeldown, location.absolute, color.gray, text = "Pending", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showSweeps and debug and bullSweep ? low : na, "Confirmed SSL history", shape.labelup, location.absolute, color.green, text = "SSL", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showSweeps and debug and bearSweep ? high : na, "Confirmed BSL history", shape.labeldown, location.absolute, color.red, text = "BSL", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showSweeps and not debug and bullSweepRevealed ? low : na, "SSL to MSS history", shape.labelup, location.absolute, color.green, text = "SSL → MSS", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showSweeps and not debug and bearSweepRevealed ? high : na, "BSL to MSS history", shape.labeldown, location.absolute, color.red, text = "BSL → MSS", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showMss and bullMss and not bullChoch ? bullBreakPrice : na, "Bull MSS history", shape.labelup, location.absolute, color.green, text = "MSS", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showMss and bearMss and not bearChoch ? bearBreakPrice : na, "Bear MSS history", shape.labeldown, location.absolute, color.red, text = "MSS", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showMss and bullChoch ? bullBreakPrice : na, "Bull CHoCH history", shape.labelup, location.absolute, color.green, text = "CHoCH", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showMss and bearChoch ? bearBreakPrice : na, "Bear CHoCH history", shape.labeldown, location.absolute, color.red, text = "CHoCH", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showTriple and bullTriple ? low : na, "Bull triple history", shape.diamond, location.absolute, color.green, text = "Triple", textcolor = color.green, size = size.tiny)
+plotshape(preserveHistory and showTriple and bearTriple ? high : na, "Bear triple history", shape.diamond, location.absolute, color.red, text = "Triple", textcolor = color.red, size = size.tiny)
 
 // Hidden output plots also supply frozen risk values in entry alert messages.
 plot(lastTrade.entry, "Entry", display = display.none)
