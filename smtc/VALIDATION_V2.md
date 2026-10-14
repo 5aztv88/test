@@ -8,6 +8,8 @@ Not executed: TradingView compiler/type checker, full Pine series semantics, rea
 
 No unintended tracked-file modifications occurred; this initially empty repository has new deliverables under `smtc/`. V1 is preserved outside the checkout at `/workspace/smtc-backup/SMTC_v1.pine`.
 
-Final SMTC_v2.pine SHA-256: `b84765cf99b066554e0e349e1d4a468521063f5e2cf00e526acc4daef29ae5cd`.
+Final SMTC_v2.pine SHA-256: `1d91648fabe48c5e25cdfdf125da1a8ac5f81b3fdfa36751784334990d59086b`.
 
 SMTC.pine, SMTC.txt, SMTC_v2.txt and the workspace text copies are byte-identical to that source.
+
+TradingView reported CE10150 for the reserved `text` parameter in `f_label`. Renamed that parameter and its reference to `caption` in every Pine/text copy. Local grammar/helper checks cannot establish TradingView compiler acceptance; further compiler errors remain possible.

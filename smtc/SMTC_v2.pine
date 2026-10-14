@@ -287,8 +287,8 @@ type View
     bool completed = false
     int finishedBar = na
 var array<View> views = array.new<View>()
-f_label(View v, float price, string text, color shade, bool large) =>
-    label item = label.new(bar_index, price, text, xloc = xloc.bar_index, yloc = yloc.price, style = v.direction == 1 ? label.style_label_up : label.style_label_down, color = shade, textcolor = color.white, size = large ? size.normal : size.tiny)
+f_label(View v, float price, string caption, color shade, bool large) =>
+    label item = label.new(bar_index, price, caption, xloc = xloc.bar_index, yloc = yloc.price, style = v.direction == 1 ? label.style_label_up : label.style_label_down, color = shade, textcolor = color.white, size = large ? size.normal : size.tiny)
     array.push(v.labels, item)
     item
 f_line(View v, int start, float price, int finish, color shade, string style) =>
