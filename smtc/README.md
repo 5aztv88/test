@@ -1,5 +1,7 @@
 # Smart Money Triple Confirmation V2
 
+Experimental signal-quality research is available separately: [investigation and test protocol](INVESTIGATION_V3.md), [V3 indicator](SMTC_v3.pine), and [Strategy Tester comparison](SMTC_research_strategy.pine). V2 remains the baseline. No performance improvement or TradingView compilation has been verified for the experimental files.
+
 Read [AUDIT_V2.md](AUDIT_V2.md) first for the five requested findings. [SMTC_v2.pine](SMTC_v2.pine) is the complete Pine Script v6 source; `SMTC.pine` and the `.txt` copies contain the same current release.
 
 Copy the entire source into a new TradingView Pine Editor tab, save, and add to a standard OHLC chart. Remove the previous chart instance before adding V2 so its scale assignment refreshes. V2 uses `scale.none`; all event labels explicitly use bar-index and price coordinates. If an existing instance still floats, use **Pin to scale** and choose the symbol's scale. No standalone FVG, unconfirmed sweep, or same-bar FVG retest can create an entry. **Preserve full loaded signal history is now enabled by default**: plotted events remain on all loaded bars, while expired/mitigated FVGs are kept as frozen historical rectangles.

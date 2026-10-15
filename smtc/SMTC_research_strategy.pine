@@ -1,0 +1,942 @@
+//@version=6
+strategy("SMTC research: V2-equivalent vs V3", "SMTC TEST", overlay = true, scale = scale.none, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 2000, initial_capital = 100000, currency = currency.USD, default_qty_type = strategy.fixed, default_qty_value = 10000, pyramiding = 0, commission_type = strategy.commission.cash_per_contract, commission_value = 0.00005, slippage = 1, process_orders_on_close = false, calc_on_order_fills = false, calc_on_every_tick = false)
+
+// All event processing is gated by barstate.isconfirmed. Default thresholds
+// are V2's requested values in Custom mode; presets are documented.
+string GL = "1. Liquidity Sweep Settings"
+string GM = "2. Market Structure Settings"
+string GF = "3. FVG Settings"
+string GC = "4. Signal Confirmation Settings"
+string GH = "5. Higher Timeframe Filters"
+string GS = "6. Session Filters"
+string GR = "7. Risk Management"
+string GV = "8. Visual Settings"
+string GA = "9. Alert Settings"
+string GQ = "10. Experimental Quality Controls"
+// Research comparison is FIXED-R only. Both variants use the same
+// symbol/timeframe, costs and next-bar-open fill model. Not a backtest result.
+string comparisonMode = input.string("V3 quality", "Variant", options = ["V2-equivalent fixed-R baseline", "V3 quality"], group = "0. Research comparison")
+bool qualityVariant = comparisonMode == "V3 quality"
+string preset = input.string("Custom", "Numeric preset (Custom uses individual inputs)", options = ["Custom", "Aggressive", "Balanced", "Conservative"], group = GC)
+int externalLenInput = input.int(10, "External pivot left/right", minval = 2, maxval = 50, group = GL)
+int internalLenInput = input.int(3, "Internal pivot left/right", minval = 1, maxval = 20, group = GL)
+float minPenetrationInput = input.float(0.10, "Minimum sweep penetration / ATR", minval = 0.01, step = 0.01, group = GL)
+int reclaimBarsInput = input.int(2, "Reclaim bars, including penetration candle", minval = 1, maxval = 10, group = GL)
+bool previousDayPools = input.bool(true, "Use previous day high/low (highest priority)", group = GL)
+bool sessionPools = input.bool(false, "Use completed London / NY high/low", group = GL)
+bool internalPools = input.bool(false, "Allow internal liquidity in Aggressive mode only", group = GL)
+bool equalPools = input.bool(true, "Recognize adjacent equal external levels", group = GL)
+float equalTolerance = input.float(0.10, "Equal external tolerance / ATR", minval = 0, step = 0.01, group = GL)
+int poolMaxAge = input.int(500, "Maximum eligible liquidity age (bars)", minval = 20, maxval = 1500, group = GL)
+int mssWindowInput = input.int(10, "Sweep → MSS maximum bars", minval = 1, maxval = 100, group = GM)
+int referenceMaxAge = input.int(100, "Maximum internal reference age", minval = 3, maxval = 500, group = GM)
+float displacementAtrInput = input.float(0.60, "Displacement body / ATR", minval = 0.1, step = 0.05, group = GM)
+float displacementRatioInput = input.float(0.60, "Displacement body / range", minval = 0.1, maxval = 1, step = 0.05, group = GM)
+float displacementCloseInput = input.float(0.75, "Directional close position", minval = 0.5, maxval = 1, step = 0.05, group = GM)
+float minGapAtrInput = input.float(0.20, "Minimum FVG size / middle ATR", minval = 0.01, step = 0.01, group = GF)
+int minGapTicks = input.int(1, "Additional minimum FVG ticks", minval = 1, group = GF)
+int fvgWindowInput = input.int(2, "MSS → FVG confirmation / impulse window", minval = 1, maxval = 10, group = GF)
+bool sameBarFvg = input.bool(true, "Allow FVG confirmation on MSS candle", group = GF)
+int retestWindowInput = input.int(15, "FVG → retest maximum bars", minval = 1, maxval = 100, group = GF)
+bool removeFullZones = input.bool(false, "Compact mode: remove fully mitigated zones", group = GF)
+int maxZones = input.int(500, "Maximum retained FVG drawings (platform cap)", minval = 1, maxval = 500, group = GF)
+string signalMode = input.string("Conservative", "Signal mode (both require later retest)", options = ["Conservative", "Aggressive"], group = GC)
+float rejectionWickBody = input.float(0.25, "Rejection wick / body minimum", minval = 0, step = 0.05, group = GC)
+float rejectionWickAtr = input.float(0.03, "Rejection wick / ATR minimum", minval = 0, step = 0.01, group = GC)
+int setupMaxAge = input.int(40, "Sweep → entry maximum bars", minval = 3, maxval = 200, group = GC)
+int atrLen = input.int(14, "ATR length", minval = 1, maxval = 100, group = GC)
+bool emaFilter = input.bool(false, "Additional chart EMA filter", group = GC)
+int emaLen = input.int(50, "Chart EMA length", options = [50, 200], group = GC)
+bool volatilityFilter = input.bool(false, "Additional ATR / mean ATR filter", group = GC)
+float volMin = input.float(0.70, "Minimum ATR / its 50-bar mean", minval = 0.1, step = 0.05, group = GC)
+float volMax = input.float(2.00, "Maximum ATR / its 50-bar mean", minval = 0.2, step = 0.05, group = GC)
+bool htfFilter = input.bool(true, "Confirmed HTF swing-structure filter", group = GH)
+bool automaticBias = input.bool(true, "Auto HTF: at least H1 and 4x chart", group = GH)
+string biasTfInput = input.timeframe("60", "Manual HTF (Auto off)", group = GH)
+string biasTf = automaticBias ? timeframe.from_seconds(int(math.max(3600, timeframe.in_seconds() * 4))) : biasTfInput
+int htfLen = input.int(5, "HTF pivot left/right", minval = 2, maxval = 30, group = GH)
+bool invalidateStaleBiasSetting = input.bool(true, "Invalidate broken / mixed HTF bias", group = GH)
+bool sessionFilter = input.bool(false, "Restrict entries to enabled sessions", group = GS)
+bool useLondon = input.bool(true, "London enabled", group = GS)
+bool useNy = input.bool(true, "New York enabled", group = GS)
+string londonSession = input.session("0800-1200", "London local window", group = GS)
+string nySession = input.session("0800-1200", "New York local window", group = GS)
+string londonTimezone = input.string("Europe/London", "London IANA timezone", group = GS)
+string nyTimezone = input.string("America/New_York", "NY IANA timezone", group = GS)
+string sessionDays = input.string("23456", "Session days (1 Sunday ... 7 Saturday)", group = GS)
+float stopBuffer = input.float(0.10, "Stop buffer / entry ATR", minval = 0, step = 0.05, group = GR)
+string targetMode = "Fixed RR"
+float targetRr = input.float(2.0, "Fixed TP2 R (gross baseline / net V3)", minval = 0.1, step = 0.1, group = GR)
+float tp1Rr = input.float(1.0, "TP1 R (omitted if not before TP2)", minval = 0.1, step = 0.1, group = GR)
+bool rrFilter = input.bool(true, "Enforce minimum TP2 R", group = GR)
+float minRr = input.float(2.0, "Minimum TP2 R (gross baseline / net V3)", minval = 0.1, step = 0.1, group = GR)
+int tradeMonitorBars = input.int(100, "Maximum live-entry status age", minval = 1, maxval = 500, group = GR)
+bool preserveHistory = input.bool(true, "Preserve full loaded signal history", group = GV, tooltip = "Keep all plotted entry/confirmation markers on loaded bars. Retain expired/mitigated FVGs and price lines until the drawing limits are reached. Overrides compact group retention and automatic zone removal, not trading expiry.")
+bool debug = input.bool(false, "Debug: pending / all confirmed sweeps and failures", group = GV)
+bool showSweeps = input.bool(true, "Sweep markers (external + MSS by default)", group = GV)
+bool showLiquidity = input.bool(true, "Swept level lines", group = GV)
+bool showMss = input.bool(true, "MSS / CHoCH", group = GV)
+bool showFvg = input.bool(true, "FVG zones", group = GV)
+bool showTriple = input.bool(true, "Triple-confirmation markers", group = GV)
+bool showEntries = input.bool(false, "Show all candidate entry markers (not filled orders)", group = GV)
+bool showEntryLine = input.bool(true, "Entry price level", group = GV)
+bool showSl = input.bool(true, "SL level", group = GV)
+bool showTp = input.bool(true, "TP1 / TP2 levels", group = GV)
+bool showDashboard = input.bool(true, "Dashboard", group = GV)
+int historyLimit = input.int(10, "Compact mode: recent completed entry drawings", minval = 1, maxval = 30, group = GV)
+int failedHistoryLimit = input.int(3, "Compact mode: incomplete / debug groups", minval = 1, maxval = 20, group = GV)
+int riskLineBars = input.int(20, "Risk level line length", minval = 1, maxval = 200, group = GV)
+string dashboardTimezone = input.string("Etc/UTC", "Dashboard timestamp timezone", group = GV)
+bool sweepAlerts = input.bool(true, "Sweep alerts (including hidden sweeps)", group = GA)
+bool mssAlerts = input.bool(true, "MSS / CHoCH alerts", group = GA)
+bool tripleAlerts = input.bool(true, "Triple-confirmation alerts", group = GA)
+bool entryAlerts = input.bool(true, "Entry alerts", group = GA)
+
+// Research thresholds, not fitted/validated performance settings.
+bool alignChartTrendSetting = input.bool(true, "Require chart EMA position + slope", group = GQ)
+int slopeBars = input.int(3, "EMA slope lookback bars", minval = 1, maxval = 20, group = GQ)
+bool requireTargetRoomSetting = input.bool(true, "Reject targets beyond nearest tracked obstacle", group = GQ)
+float targetBufferAtr = input.float(0.05, "Target buffer before obstacle / ATR", minval = 0, step = 0.01, group = GQ)
+bool antiChaseSetting = input.bool(true, "Reject late entries beyond FVG", group = GQ)
+float maxChaseAtr = input.float(0.25, "Maximum distance past FVG edge / ATR", minval = 0, step = 0.05, group = GQ)
+bool capStopSizeSetting = input.bool(false, "Optional maximum structural stop distance", group = GQ)
+float maxStopAtr = input.float(2.0, "Maximum stop distance / ATR", minval = 0.2, step = 0.1, group = GQ)
+int costTicksSetting = input.int(10, "Estimated total round-trip cost (ticks)", minval = 0, group = GQ, tooltip = "Spread + fees + slippage estimate expressed as a total price distance. Verify tick size and costs for your feed. 10 ticks is 1 pip only on a 5-digit EUR/USD feed. This is an estimate, not observed bid/ask execution.")
+
+bool invalidateStaleBias = qualityVariant and invalidateStaleBiasSetting
+bool alignChartTrend = qualityVariant and alignChartTrendSetting
+bool requireTargetRoom = qualityVariant and requireTargetRoomSetting
+bool antiChase = qualityVariant and antiChaseSetting
+bool capStopSize = qualityVariant and capStopSizeSetting
+int costTicks = qualityVariant ? costTicksSetting : 0
+
+// Numeric presets do not change signal mode, HTF/filter toggles or risk.
+int externalLen = preset == "Aggressive" ? 6 : preset == "Balanced" ? 10 : preset == "Conservative" ? 14 : externalLenInput
+int internalLen = preset == "Aggressive" ? 2 : preset == "Balanced" ? 3 : preset == "Conservative" ? 4 : internalLenInput
+float minPenetration = preset == "Aggressive" ? 0.10 : preset == "Balanced" ? 0.10 : preset == "Conservative" ? 0.15 : minPenetrationInput
+int reclaimBars = preset == "Aggressive" ? 2 : preset == "Balanced" ? 2 : preset == "Conservative" ? 2 : reclaimBarsInput
+int mssWindow = preset == "Aggressive" ? 12 : preset == "Balanced" ? 10 : preset == "Conservative" ? 8 : mssWindowInput
+float displacementAtr = preset == "Aggressive" ? 0.60 : preset == "Balanced" ? 0.60 : preset == "Conservative" ? 0.80 : displacementAtrInput
+float displacementRatio = preset == "Aggressive" ? 0.60 : preset == "Balanced" ? 0.60 : preset == "Conservative" ? 0.65 : displacementRatioInput
+float displacementClose = preset == "Aggressive" ? 0.75 : preset == "Balanced" ? 0.75 : preset == "Conservative" ? 0.80 : displacementCloseInput
+float minGapAtr = preset == "Aggressive" ? 0.20 : preset == "Balanced" ? 0.20 : preset == "Conservative" ? 0.25 : minGapAtrInput
+int fvgWindow = preset == "Aggressive" ? 3 : preset == "Balanced" ? 2 : preset == "Conservative" ? 1 : fvgWindowInput
+int retestWindow = preset == "Aggressive" ? 15 : preset == "Balanced" ? 15 : preset == "Conservative" ? 10 : retestWindowInput
+
+// Explicit state constants. FVG_CONFIRMED is an atomic event followed by
+// WAITING_RETEST on the same close; ENTRY requires a strictly later close.
+int IDLE = 0
+int SWEEP_PENDING = 1
+int SWEEP_CONFIRMED = 2
+int MSS_CONFIRMED = 3
+int FVG_CONFIRMED = 4
+int WAITING_RETEST = 5
+int ENTRY_CONFIRMED = 6
+int EXPIRED = 7
+int INVALIDATED = 8
+float atr = ta.atr(atrLen)
+float meanAtr = ta.sma(atr, 50)
+float chartEma = ta.ema(close, emaLen)
+float chartEmaEarlier = chartEma[slopeBars]
+
+// Invalidated structure does not revive merely because price bounces.
+// After neutralization, BOTH pivot confirmation timestamps must be newer
+// than the reset bar before a fresh HH+HL/LH+LL pair can restore bias.
+f_biasStep(int previousBias, int resetBar, float protectedLevel, float c, int pairBias, int highAt, int lowAt, int now, float swingHigh, float swingLow) =>
+    int nextBias = previousBias
+    int nextReset = resetBar
+    float nextProtected = protectedLevel
+    bool broken = previousBias != 0 and not na(protectedLevel) and previousBias * (c - protectedLevel) < 0
+    bool freshPair = not na(highAt) and not na(lowAt) and highAt > resetBar and lowAt > resetBar
+    if broken
+        nextBias := 0
+        nextReset := now
+        nextProtected := na
+    else if pairBias != 0 and freshPair and (pairBias == 1 ? c > swingLow : c < swingHigh)
+        nextBias := pairBias
+        nextProtected := pairBias == 1 ? swingLow : swingHigh
+    else if previousBias != 0 and pairBias != previousBias
+        nextBias := 0
+        nextReset := now
+        nextProtected := na
+    [nextBias, nextReset, nextProtected]
+f_htfStructure(int length) =>
+    float pHigh = ta.pivothigh(high, length, length)
+    float pLow = ta.pivotlow(low, length, length)
+    float h0 = ta.valuewhen(not na(pHigh), pHigh, 0)
+    float h1 = ta.valuewhen(not na(pHigh), pHigh, 1)
+    float l0 = ta.valuewhen(not na(pLow), pLow, 0)
+    float l1 = ta.valuewhen(not na(pLow), pLow, 1)
+    int highAt = ta.valuewhen(not na(pHigh), bar_index, 0)
+    int lowAt = ta.valuewhen(not na(pLow), bar_index, 0)
+    int pairBias = not na(h1) and not na(l1) ? (h0 > h1 and l0 > l1 ? 1 : h0 < h1 and l0 < l1 ? -1 : 0) : 0
+    var int activeBias = 0
+    var int resetAt = -1
+    var float activeProtected = na
+    [updatedBias, updatedReset, updatedProtected] = f_biasStep(activeBias, resetAt, activeProtected, close, pairBias, highAt, lowAt, bar_index, h0, l0)
+    activeBias := updatedBias
+    resetAt := updatedReset
+    activeProtected := updatedProtected
+    // Offset every expression: only the last CLOSED HTF bar is sampled.
+    int effectiveBias = invalidateStaleBias ? activeBias : pairBias
+    [effectiveBias[1], h0[1], l0[1], activeProtected[1]]
+[htfBias, htfHigh, htfLow, htfProtected] = request.security(syminfo.tickerid, biasTf, f_htfStructure(htfLen), lookahead = barmerge.lookahead_on)
+[dayHigh, dayLow, dayStamp] = request.security(syminfo.tickerid, "D", [high[1], low[1], time[1]], lookahead = barmerge.lookahead_on)
+if barstate.isfirst
+    if htfFilter and timeframe.in_seconds(biasTf) <= timeframe.in_seconds()
+        runtime.error("HTF must be above the chart timeframe. Select H4 for H1, or disable the HTF filter.")
+    if previousDayPools and timeframe.in_seconds() >= timeframe.in_seconds("D")
+        runtime.error("Previous-day liquidity requires an intraday chart. Disable it for daily and higher charts.")
+    if volMin > volMax
+        runtime.error("Minimum volatility ratio exceeds maximum.")
+bool londonIn = not na(time(timeframe.period, londonSession + ":" + sessionDays, londonTimezone))
+bool nyIn = not na(time(timeframe.period, nySession + ":" + sessionDays, nyTimezone))
+int londonKey = time("1D", londonSession + ":" + sessionDays, londonTimezone)
+int nyKey = time("1D", nySession + ":" + sessionDays, nyTimezone)
+bool sessionOk = not sessionFilter or (useLondon and londonIn) or (useNy and nyIn)
+bool volatilityOk = not volatilityFilter or (not na(meanAtr) and atr >= meanAtr * volMin and atr <= meanAtr * volMax)
+
+// Geometry helpers are used by the actual state processor and local
+// diagnostic harness. They use only explicit, already-closed OHLC inputs.
+f_displaced(int d, float o, float h, float l, float c, float a) =>
+    float body = math.abs(c - o)
+    float span = h - l
+    float position = span > 0 ? (d == 1 ? c - l : h - c) / span : 0
+    d * (c - o) > 0 and span > 0 and not na(a) and body >= a * displacementAtr and body / span >= displacementRatio and position >= displacementClose
+f_rejection(int d, float o, float h, float l, float c, float a, float top, float bottom) =>
+    float body = math.abs(c - o)
+    float wick = d == 1 ? math.min(o, c) - l : h - math.max(o, c)
+    bool touch = l <= top and h >= bottom
+    bool midpoint = d == 1 ? c > (top + bottom) / 2 : c < (top + bottom) / 2
+    touch and d * (c - o) > 0 and midpoint and wick > 0 and wick >= body * rejectionWickBody and wick >= a * rejectionWickAtr
+f_gap(int d, float h1, float l1, float h3, float l3, float middleAtr) =>
+    float top = d == 1 ? l3 : l1
+    float bottom = d == 1 ? h1 : h3
+    top > bottom and top - bottom >= math.max(middleAtr * minGapAtr, syminfo.mintick * minGapTicks)
+
+f_reclaimed(int d, float level, float extreme, float c, float frozenAtr) =>
+    d * (c - level) > 0 and d * (level - extreme) >= frozenAtr * minPenetration
+f_associated(int d, int now, int sweepBar, int mssBar, float middleHigh, float middleLow, float anchorHigh, float anchorLow, float reference, bool intact) =>
+    int delay = now - mssBar
+    bool timing = delay <= fvgWindow and (sameBarFvg ? delay >= 0 : delay >= 1) and math.abs(now - 1 - mssBar) <= fvgWindow and now - 2 >= sweepBar
+    bool reachesStructure = d == 1 ? middleHigh > reference : middleLow < reference
+    timing and intact and middleHigh >= anchorLow and middleLow <= anchorHigh and reachesStructure
+
+f_netR(int d, float entryPrice, float stopPrice, float targetPrice, float costs) =>
+    float riskDistance = d * (entryPrice - stopPrice)
+    riskDistance > 0 and not na(targetPrice) ? (d * (targetPrice - entryPrice) - costs) / (riskDistance + costs) : na
+f_quality(int d, float entryPrice, float stopPrice, float obstacle, float top, float bottom, float a, float costs) =>
+    float riskDistance = d * (entryPrice - stopPrice)
+    float obstacleTarget = not na(obstacle) ? obstacle - d * a * targetBufferAtr : na
+    float chosenTarget = targetMode == "Opposing liquidity" ? obstacleTarget : entryPrice + d * (targetRr * (riskDistance + costs) + costs)
+    float netR = f_netR(d, entryPrice, stopPrice, chosenTarget, costs)
+    float roomR = f_netR(d, entryPrice, stopPrice, obstacleTarget, costs)
+    float chase = math.max(0, d == 1 ? entryPrice - top : bottom - entryPrice)
+    bool chaseOk = a > 0 and chase <= a * maxChaseAtr
+    bool stopSizeOk = a > 0 and riskDistance <= a * maxStopAtr
+    bool targetOk = riskDistance > syminfo.mintick and not na(chosenTarget) and d * (chosenTarget - entryPrice) > costs and (not rrFilter or (not na(netR) and netR + 0.000000001 >= minRr))
+    bool roomOk = not na(roomR) and (not rrFilter or roomR + 0.000000001 >= minRr) and d * (obstacleTarget - chosenTarget) >= -syminfo.mintick * 0.01
+    [chosenTarget, netR, roomR, chaseOk, stopSizeOk, targetOk, roomOk]
+
+// Deterministic lifecycle core. Returned event pulses are immutable facts
+// for THIS detection bar. Filters failing on an entry attempt consume it.
+f_transition(int stage, int pendingAge, int sweepAge, int mssAge, int gapAge, bool reclaim, bool referenceOk, bool invalid, bool fullFill, bool cross, bool displaced, bool gap, bool touch, bool rejection, bool filters) =>
+    int next = stage
+    bool sweepEvent = false
+    bool mssEvent = false
+    bool gapEvent = false
+    bool entryEvent = false
+    string reason = ""
+    if stage == SWEEP_PENDING
+        if pendingAge >= reclaimBars
+            next := EXPIRED
+            reason := "Breakout: reclaim expired"
+        else if reclaim
+            sweepEvent := true
+            next := SWEEP_CONFIRMED
+            if not referenceOk
+                next := INVALIDATED
+                reason := "Sweep confirmed; no eligible MSS reference"
+    if stage >= SWEEP_CONFIRMED and stage <= WAITING_RETEST
+        if invalid or (stage == WAITING_RETEST and fullFill)
+            next := INVALIDATED
+            reason := invalid ? "Sweep extreme broken" : "FVG fully mitigated"
+        else if sweepAge > setupMaxAge or (stage == SWEEP_CONFIRMED and sweepAge > mssWindow) or (stage == MSS_CONFIRMED and mssAge > fvgWindow) or (stage == WAITING_RETEST and gapAge > retestWindow)
+            next := EXPIRED
+            reason := "Setup / phase expired"
+        else
+            if stage == SWEEP_CONFIRMED and sweepAge > 0 and cross
+                if displaced
+                    next := MSS_CONFIRMED
+                    mssEvent := true
+                else
+                    next := INVALIDATED
+                    reason := "First close break lacks displacement"
+            if next == MSS_CONFIRMED and gap
+                next := FVG_CONFIRMED
+                gapEvent := true
+                next := WAITING_RETEST
+            if stage == WAITING_RETEST and gapAge > 0 and touch and rejection
+                if filters
+                    next := ENTRY_CONFIRMED
+                    entryEvent := true
+                else
+                    next := INVALIDATED
+                    reason := "Entry filters rejected (consumed)"
+    [next, sweepEvent, mssEvent, gapEvent, entryEvent, reason]
+
+// Liquidity lifecycle: 0 eligible, 1 reserved/pending, 2 confirmed swept,
+// 3 breakout/retired. A retired or swept object NEVER returns to eligible.
+f_poolState(int state, bool breach, bool confirmed, bool failed) =>
+    int result = state
+    if state == 0 and breach
+        result := 1
+    if result == 1
+        if confirmed
+            result := 2
+        else if failed
+            result := 3
+    result
+
+type Pool
+    float price
+    int origin
+    int known
+    int rank
+    string source
+    int status = 0
+    bool equalLevel = false
+var array<Pool> highPools = array.new<Pool>()
+var array<Pool> lowPools = array.new<Pool>()
+f_addPool(array<Pool> pools, float price, int origin, int rank, string source, bool highSide, int knownAt) =>
+    float level = price
+    int firstOrigin = origin
+    bool equalLevel = false
+    // Never merge into a consumed object. Internal pools are not clustered.
+    if equalPools and rank == 2 and array.size(pools) > 0
+        for index = array.size(pools) - 1 to 0
+            Pool previous = array.get(pools, index)
+            if previous.rank == 2
+                if previous.status == 0 and math.abs(previous.price - price) <= atr * equalTolerance
+                    equalLevel := true
+                    level := highSide ? math.max(previous.price, price) : math.min(previous.price, price)
+                    firstOrigin := previous.origin
+                    previous.status := 3
+                break
+    // Exact-price aliases across day/session/pivots share one eligible pool.
+    bool alias = false
+    if array.size(pools) > 0
+        for index = 0 to array.size(pools) - 1
+            Pool previous = array.get(pools, index)
+            if math.abs(previous.price - level) < syminfo.mintick * 0.5
+                if previous.status == 0
+                    if rank > previous.rank
+                        previous.rank := rank
+                        previous.source := source
+                    alias := true
+                // Re-establishment after a consumed level needs a genuinely
+                // newer origin, not a newly injected alias of the old event.
+                else if origin <= previous.origin
+                    alias := true
+    if not alias and not na(level)
+        // A level first registered after this candle already breached it
+        // is retired, not offered later as an untouched pool.
+        int initialStatus = knownAt >= bar_index and (highSide ? high > level : low < level) ? 3 : 0
+        array.push(pools, Pool.new(level, firstOrigin, knownAt, rank, source, initialStatus, equalLevel))
+    if array.size(pools) > 200
+        array.shift(pools)
+
+type View
+    int id
+    int direction
+    array<label> labels
+    array<line> lines
+    box gap = na
+    float top = na
+    float bottom = na
+    int born = na
+    bool full = false
+    bool partial = false
+    bool zoneExpired = false
+    bool finished = false
+    bool completed = false
+    int finishedBar = na
+var array<View> views = array.new<View>()
+// Drawing IDs are bounded by platform capacity, independently of plots.
+var array<View> retainedZones = array.new<View>()
+var array<line> retainedLines = array.new<line>()
+var array<label> retainedLabels = array.new<label>()
+f_label(View v, float price, string caption, color shade, bool large) =>
+    if preserveHistory and array.size(retainedLabels) >= 500
+        label.delete(array.shift(retainedLabels))
+    label item = label.new(bar_index, price, caption, xloc = xloc.bar_index, yloc = yloc.price, style = v.direction == 1 ? label.style_label_up : label.style_label_down, color = shade, textcolor = color.white, size = large ? size.normal : size.tiny)
+    array.push(v.labels, item)
+    if preserveHistory
+        array.push(retainedLabels, item)
+    item
+f_line(View v, int start, float price, int finish, color shade, string style) =>
+    if preserveHistory and array.size(retainedLines) >= 500
+        line.delete(array.shift(retainedLines))
+    line item = line.new(math.max(start, bar_index - 1900), price, finish, price, xloc = xloc.bar_index, color = shade, style = style)
+    array.push(v.lines, item)
+    if preserveHistory
+        array.push(retainedLines, item)
+    item
+f_deleteView(View v) =>
+    if array.size(v.labels) > 0
+        for item in v.labels
+            label.delete(item)
+    if array.size(v.lines) > 0
+        for item in v.lines
+            line.delete(item)
+    if not na(v.gap)
+        box.delete(v.gap)
+        v.gap := na
+
+type Event
+    int setupId
+    int detected
+    string kind
+    float price
+var array<Event> ledger = array.new<Event>()
+f_record(int id, string kind, float price) =>
+    array.push(ledger, Event.new(id, bar_index, kind, price))
+    if array.size(ledger) > 200
+        array.shift(ledger)
+
+type Setup
+    int direction
+    int id = 0
+    int stage = 0
+    Pool pool = na
+    View view = na
+    int start = na
+    int sweepBar = na
+    int mssBar = na
+    int gapBar = na
+    float penetrationAtr = na
+    float extreme = na
+    float reference = na
+    int referenceOrigin = na
+    float externalReference = na
+    int trend = 0
+    float anchorHigh = na
+    float anchorLow = na
+    float top = na
+    float bottom = na
+    bool impulseIntact = true
+    bool sweepDrawn = false
+    label pendingMarker = na
+var array<Setup> setups = array.from(Setup.new(1), Setup.new(-1))
+var int nextId = 0
+var float intHigh = na
+var float intLow = na
+var int intHighOrigin = na
+var int intLowOrigin = na
+var float extHigh = na
+var float extLow = na
+var float previousExtHigh = na
+var float previousExtLow = na
+var int chartBias = 0
+float externalHighPivot = ta.pivothigh(high, externalLen, externalLen)
+float externalLowPivot = ta.pivotlow(low, externalLen, externalLen)
+float internalHighPivot = ta.pivothigh(high, internalLen, internalLen)
+float internalLowPivot = ta.pivotlow(low, internalLen, internalLen)
+
+// Completed-session liquidity uses chart OHLC only. The accumulating session
+// is never eligible. Enable on intraday charts aligned with session boundaries.
+var array<float> sessionHighs = array.new<float>(2, na)
+var array<float> sessionLows = array.new<float>(2, na)
+var array<int> sessionHighOrigins = array.new<int>(2, na)
+var array<int> sessionLowOrigins = array.new<int>(2, na)
+var array<bool> sessionOpen = array.new<bool>(2, false)
+var array<int> sessionKeys = array.new<int>(2, na)
+var int lastDayStamp = na
+var float latestSweepPrice = na
+var float latestMssPrice = na
+var string latestRejected = "None"
+
+type Trade
+    int id = 0
+    int direction = 0
+    int entered = na
+    int timestamp = na
+    float entry = na
+    float stop = na
+    float tp1 = na
+    float tp2 = na
+    bool live = false
+    string status = "Historical"
+    string outcome = "None"
+var Trade lastTrade = Trade.new()
+bool bullSweep = false
+bool bearSweep = false
+bool bullMss = false
+bool bearMss = false
+bool bullTriple = false
+bool bearTriple = false
+bool bullPending = false
+bool bearPending = false
+bool bullSweepRevealed = false
+bool bearSweepRevealed = false
+bool bullChoch = false
+bool bearChoch = false
+float bullBreakPrice = na
+float bearBreakPrice = na
+bool buy = false
+bool sell = false
+array<bool> proposed = array.from(false, false)
+array<float> stops = array.new<float>(2, na)
+array<float> targets = array.new<float>(2, na)
+array<float> tp1s = array.new<float>(2, na)
+var array<float> highObstacles = array.new<float>()
+var array<float> lowObstacles = array.new<float>()
+var string lastQuality = "No entry evaluated"
+var float lastNetR = na
+var float lastRoomR = na
+
+if barstate.isconfirmed
+    array.clear(highObstacles)
+    array.clear(lowObstacles)
+    // PD values are already closed at this bar's OPEN. Completed sessions
+    // use ONLY preceding closed bars. They can be swept on the first bar
+    // after the boundary; current-session highs/lows are never eligible.
+    if previousDayPools and not na(dayStamp) and (na(lastDayStamp) or dayStamp != lastDayStamp)
+        f_addPool(highPools, dayHigh, bar_index - 1, 4, "Previous day", true, bar_index - 1)
+        f_addPool(lowPools, dayLow, bar_index - 1, 4, "Previous day", false, bar_index - 1)
+        lastDayStamp := dayStamp
+    for sessionIndex = 0 to 1
+        bool enabled = sessionIndex == 0 ? useLondon : useNy
+        bool inside = enabled and (sessionIndex == 0 ? londonIn : nyIn)
+        int key = sessionIndex == 0 ? londonKey : nyKey
+        bool changed = inside and key != array.get(sessionKeys, sessionIndex)
+        if array.get(sessionOpen, sessionIndex) and (not inside or changed) and sessionPools and timeframe.isintraday
+            string source = sessionIndex == 0 ? "London completed" : "NY completed"
+            f_addPool(highPools, array.get(sessionHighs, sessionIndex), array.get(sessionHighOrigins, sessionIndex), 3, source, true, bar_index - 1)
+            f_addPool(lowPools, array.get(sessionLows, sessionIndex), array.get(sessionLowOrigins, sessionIndex), 3, source, false, bar_index - 1)
+
+    // Levels in these snapshots existed before the current candle.
+    if not na(intHigh)
+        array.push(highObstacles, intHigh)
+    if not na(intLow)
+        array.push(lowObstacles, intLow)
+    if not na(htfHigh)
+        array.push(highObstacles, htfHigh)
+    if not na(htfLow)
+        array.push(lowObstacles, htfLow)
+    for p in highPools
+        if p.status == 0 and p.rank >= 2 and p.known < bar_index and bar_index - p.known <= poolMaxAge
+            array.push(highObstacles, p.price)
+    for p in lowPools
+        if p.status == 0 and p.rank >= 2 and p.known < bar_index and bar_index - p.known <= poolMaxAge
+            array.push(lowObstacles, p.price)
+
+    // Available pivots may update at this close. MSS references freeze ONLY
+    // at reclaim confirmation, including pivots confirmed during the sweep.
+    if not na(internalHighPivot)
+        intHigh := internalHighPivot
+        intHighOrigin := bar_index - internalLen
+    if not na(internalLowPivot)
+        intLow := internalLowPivot
+        intLowOrigin := bar_index - internalLen
+    if not na(externalHighPivot)
+        previousExtHigh := extHigh
+        extHigh := externalHighPivot
+    if not na(externalLowPivot)
+        previousExtLow := extLow
+        extLow := externalLowPivot
+    chartBias := not na(previousExtHigh) and not na(previousExtLow) ? (extHigh > previousExtHigh and extLow > previousExtLow ? 1 : extHigh < previousExtHigh and extLow < previousExtLow ? -1 : 0) : 0
+
+    if lastTrade.id > 0 and bar_index > lastTrade.entered and lastTrade.outcome == "Open"
+        bool stopHit = lastTrade.direction == 1 ? low <= lastTrade.stop : high >= lastTrade.stop
+        bool targetHit = lastTrade.direction == 1 ? high >= lastTrade.tp2 : low <= lastTrade.tp2
+        if stopHit
+            lastTrade.status := "Invalidated"
+            lastTrade.outcome := targetHit ? "SL/TP2 same bar: order unknown" : "SL touched"
+        else if targetHit
+            lastTrade.status := "Historical"
+            lastTrade.outcome := "TP2 touched"
+        else if bar_index - lastTrade.entered > tradeMonitorBars
+            lastTrade.status := "Historical"
+            lastTrade.outcome := "Monitoring expired"
+
+    // Expiry/mitigation still disable trading. In full-history mode they
+    // freeze/fade the rectangle rather than deleting its historical evidence.
+    if array.size(views) > 0
+        for v in views
+            if not na(v.gap) and bar_index > v.born and not v.zoneExpired and (not v.full or not preserveHistory)
+                bool expired = bar_index - v.born > retestWindow
+                if expired
+                    v.zoneExpired := true
+                else
+                    bool fullNow = v.direction == 1 ? low <= v.bottom : high >= v.top
+                    bool touched = low <= v.top and high >= v.bottom
+                    v.partial := v.partial or touched
+                    bool wasFull = v.full
+                    v.full := v.full or fullNow
+                    if not wasFull
+                        box.set_right(v.gap, bar_index)
+                box.set_bgcolor(v.gap, v.zoneExpired ? color.new(color.gray, 90) : color.new(v.direction == 1 ? color.blue : color.orange, v.full ? 94 : v.partial ? 88 : 82))
+                if not preserveHistory and (expired or (v.full and removeFullZones))
+                    box.delete(v.gap)
+                    v.gap := na
+
+    for side = 0 to 1
+        Setup s = array.get(setups, side)
+        int d = s.direction
+        color shade = d == 1 ? color.green : color.red
+        array<Pool> pools = d == 1 ? lowPools : highPools
+        bool available = s.stage == IDLE or s.stage >= ENTRY_CONFIRMED
+        Pool chosen = na
+        int chosenIndex = -1
+        // Retire all crossed nonselected levels as breakout/ignored breaches.
+        // Never rearm a retired pool. Priority: PD (4), session (3), external
+        // (2), optional internal (1); closest crossed level breaks ties.
+        if array.size(pools) > 0
+            for poolIndex = 0 to array.size(pools) - 1
+                Pool p = array.get(pools, poolIndex)
+                if p.status == 0
+                    bool old = bar_index - p.known > poolMaxAge
+                    bool crossed = bar_index > p.known and (d == 1 ? low < p.price : high > p.price)
+                    if old
+                        p.status := 3
+                    else if crossed
+                        bool approached = d == 1 ? close[1] >= p.price : close[1] <= p.price
+                        if available and approached and not na(atr)
+                            bool better = na(chosen)
+                            if not na(chosen)
+                                better := p.rank > chosen.rank or (p.rank == chosen.rank and (d == 1 ? p.price > chosen.price : p.price < chosen.price))
+                            if better
+                                chosen := p
+                                chosenIndex := poolIndex
+            // Reserve only the selected virgin pool. Other crossed levels
+            // are retired directly; none passes from retired to eligible.
+            for poolIndex = 0 to array.size(pools) - 1
+                Pool p = array.get(pools, poolIndex)
+                bool crossed = p.status == 0 and bar_index > p.known and (d == 1 ? low < p.price : high > p.price)
+                if crossed
+                    p.status := f_poolState(p.status, true, false, poolIndex != chosenIndex)
+        if not na(chosen)
+            // The selected pool is already reserved by the initial scan.
+            nextId += 1
+            View v = View.new(nextId, d, array.new<label>(), array.new<line>())
+            array.push(views, v)
+            s := Setup.new(d)
+            s.id := nextId
+            s.stage := SWEEP_PENDING
+            s.pool := chosen
+            s.view := v
+            s.start := bar_index
+            s.penetrationAtr := atr
+            s.extreme := d == 1 ? low : high
+            array.set(setups, side, s)
+            f_record(s.id, "SWEEP_PENDING", s.pool.price)
+            bullPending := bullPending or d == 1
+            bearPending := bearPending or d == -1
+            if debug and showSweeps and not preserveHistory
+                s.pendingMarker := f_label(v, d == 1 ? low : high, "Pending #" + str.tostring(s.id), color.gray, false)
+        if s.stage >= SWEEP_PENDING and s.stage <= WAITING_RETEST
+            int oldStage = s.stage
+            if oldStage == SWEEP_PENDING
+                s.extreme := d == 1 ? math.min(s.extreme, low) : math.max(s.extreme, high)
+            float candidateReference = d == 1 ? intHigh : intLow
+            int candidateOrigin = d == 1 ? intHighOrigin : intLowOrigin
+            bool referenceOk = not na(candidateReference) and not na(candidateOrigin) and bar_index - candidateOrigin <= referenceMaxAge and (d == 1 ? close <= candidateReference : close >= candidateReference)
+            bool reclaim = f_reclaimed(d, s.pool.price, s.extreme, close, s.penetrationAtr)
+            bool invalid = oldStage >= SWEEP_CONFIRMED and (d == 1 ? low < s.extreme : high > s.extreme)
+            bool fullFill = oldStage == WAITING_RETEST and (d == 1 ? low <= s.bottom : high >= s.top)
+            bool cross = oldStage == SWEEP_CONFIRMED and (d == 1 ? close > s.reference and close[1] <= s.reference : close < s.reference and close[1] >= s.reference)
+            bool displaced = f_displaced(d, open, high, low, close, atr)
+            bool possibleMss = oldStage == SWEEP_CONFIRMED and cross and displaced and bar_index > s.sweepBar
+            int anchorBar = possibleMss ? bar_index : s.mssBar
+            float anchorHigh = possibleMss ? high : s.anchorHigh
+            float anchorLow = possibleMss ? low : s.anchorLow
+            if oldStage == MSS_CONFIRMED and bar_index - 1 > s.mssBar
+                // Every intervening middle candle must remain directional,
+                // progress beyond structure, and overlap its predecessor.
+                s.impulseIntact := s.impulseIntact and d * (close[1] - open[1]) > 0 and d * (close[1] - close[2]) >= 0 and d * (close[1] - s.reference) > 0 and high[1] >= low[2] and low[1] <= high[2]
+            bool gap = false
+            if possibleMss or oldStage == MSS_CONFIRMED
+                gap := f_associated(d, bar_index, s.sweepBar, anchorBar, high[1], low[1], anchorHigh, anchorLow, s.reference, s.impulseIntact) and f_gap(d, high[2], low[2], high, low, atr[1]) and f_displaced(d, open[1], high[1], low[1], close[1], atr[1])
+            bool touch = oldStage == WAITING_RETEST and low <= s.top and high >= s.bottom
+            bool rejection = signalMode == "Aggressive" ? d * (close - open) > 0 and (d == 1 ? close > (s.top + s.bottom) / 2 : close < (s.top + s.bottom) / 2) : f_rejection(d, open, high, low, close, atr, s.top, s.bottom)
+            float stop = s.extreme - d * atr * stopBuffer
+            float risk = d * (close - stop)
+            float obstacle = na
+            array<float> obstacles = d == 1 ? highObstacles : lowObstacles
+            for price in obstacles
+                bool ahead = d * (price - close) > 0
+                if ahead and (na(obstacle) or (d == 1 ? price < obstacle : price > obstacle))
+                    obstacle := price
+            float estimatedCosts = costTicks * syminfo.mintick
+            [target, achievedRr, availableRr, chaseOk, stopSizeOk, targetOk, roomOk] = f_quality(d, close, stop, obstacle, s.top, s.bottom, atr, estimatedCosts)
+            bool riskOk = targetOk and (not requireTargetRoom or roomOk) and (not antiChase or chaseOk) and (not capStopSize or stopSizeOk)
+            bool chartTrendOk = not alignChartTrend or (not na(chartEmaEarlier) and d * (close - chartEma) > 0 and d * (chartEma - chartEmaEarlier) > 0)
+            bool trendOk = (not htfFilter or htfBias == d) and (not emaFilter or d * (close - chartEma) > 0) and chartTrendOk
+            bool filters = riskOk and trendOk and sessionOk and volatilityOk
+            string qualityReason = not targetOk ? "Invalid target / net RR" : requireTargetRoom and not roomOk ? "Insufficient room to tracked obstacle" : antiChase and not chaseOk ? "Entry chased beyond FVG" : capStopSize and not stopSizeOk ? "Structural stop too wide" : not trendOk ? "HTF / chart trend rejected" : not sessionOk ? "Session rejected" : not volatilityOk ? "Volatility rejected" : "Entry checks passed"
+            if oldStage == WAITING_RETEST and touch and rejection
+                lastQuality := "#" + str.tostring(s.id) + " " + qualityReason
+                lastNetR := achievedRr
+                lastRoomR := availableRr
+            [newStage, swept, shifted, formed, entry, reason] = f_transition(oldStage, bar_index - s.start, na(s.sweepBar) ? 0 : bar_index - s.sweepBar, na(s.mssBar) ? 0 : bar_index - s.mssBar, na(s.gapBar) ? 0 : bar_index - s.gapBar, reclaim, referenceOk, invalid, fullFill, cross, displaced, gap, touch, rejection, filters)
+            s.stage := newStage
+            if swept
+                s.pool.status := f_poolState(s.pool.status, false, true, false)
+                s.sweepBar := bar_index
+                s.reference := candidateReference
+                s.referenceOrigin := candidateOrigin
+                s.externalReference := d == 1 ? extHigh : extLow
+                s.trend := chartBias
+                latestSweepPrice := s.pool.price
+                bullSweep := bullSweep or d == 1
+                bearSweep := bearSweep or d == -1
+                f_record(s.id, "SWEEP_CONFIRMED", s.pool.price)
+                if not na(s.pendingMarker)
+                    label.delete(s.pendingMarker)
+                    s.pendingMarker := na
+                if debug and showSweeps
+                    if not preserveHistory
+                        f_label(s.view, d == 1 ? low : high, (d == 1 ? "SSL" : "BSL") + " #" + str.tostring(s.id) + " " + s.pool.source, shade, false)
+                    s.sweepDrawn := true
+                    if showLiquidity
+                        f_line(s.view, s.pool.origin, s.pool.price, bar_index, shade, line.style_dotted)
+            if shifted
+                s.mssBar := bar_index
+                s.anchorHigh := high
+                s.anchorLow := low
+                s.impulseIntact := true
+                latestMssPrice := s.reference
+                bool choch = s.trend == -d and not na(s.externalReference) and d * (close - s.externalReference) > 0 and d * (close[1] - s.externalReference) <= 0
+                bullMss := bullMss or d == 1
+                bearMss := bearMss or d == -1
+                bullChoch := bullChoch or (d == 1 and choch)
+                bearChoch := bearChoch or (d == -1 and choch)
+                if d == 1
+                    bullBreakPrice := s.reference
+                else
+                    bearBreakPrice := s.reference
+                f_record(s.id, choch ? "CHoCH" : "MSS_CONFIRMED", s.reference)
+                // Default reveal occurs NOW, at MSS detection, not backdated
+                // to the prior sweep bar. The immutable ledger retains both.
+                if showSweeps and not s.sweepDrawn and s.pool.rank >= 2
+                    bullSweepRevealed := bullSweepRevealed or d == 1
+                    bearSweepRevealed := bearSweepRevealed or d == -1
+                    if not preserveHistory
+                        f_label(s.view, d == 1 ? low : high, (d == 1 ? "SSL → MSS" : "BSL → MSS") + " #" + str.tostring(s.id), shade, false)
+                    s.sweepDrawn := true
+                    if showLiquidity
+                        f_line(s.view, s.pool.origin, s.pool.price, bar_index, shade, line.style_dotted)
+                if showMss
+                    if not preserveHistory
+                        f_label(s.view, s.reference, (choch ? "CHoCH" : "MSS") + " #" + str.tostring(s.id), shade, false)
+                    f_line(s.view, s.referenceOrigin, s.reference, bar_index, shade, line.style_solid)
+            if formed
+                s.top := d == 1 ? low : low[2]
+                s.bottom := d == 1 ? high[2] : high
+                s.gapBar := bar_index
+                s.view.top := s.top
+                s.view.bottom := s.bottom
+                s.view.born := bar_index
+                f_record(s.id, "FVG_CONFIRMED", (s.top + s.bottom) / 2)
+                f_record(s.id, "WAITING_RETEST", (s.top + s.bottom) / 2)
+                bullTriple := bullTriple or d == 1
+                bearTriple := bearTriple or d == -1
+                if showFvg
+                    if preserveHistory and array.size(retainedZones) >= maxZones
+                        View oldestZone = array.shift(retainedZones)
+                        if not na(oldestZone.gap)
+                            box.delete(oldestZone.gap)
+                            oldestZone.gap := na
+                    s.view.gap := box.new(bar_index - 2, s.top, bar_index, s.bottom, border_color = color.new(d == 1 ? color.blue : color.orange, 30), bgcolor = color.new(d == 1 ? color.blue : color.orange, 82))
+                    if preserveHistory
+                        array.push(retainedZones, s.view)
+                if showTriple and not preserveHistory
+                    f_label(s.view, d == 1 ? low : high, "Triple #" + str.tostring(s.id), color.new(shade, 30), false)
+            if entry
+                array.set(proposed, side, true)
+                array.set(stops, side, stop)
+                array.set(targets, side, target)
+                array.set(tp1s, side, tp1Rr < achievedRr ? close + d * risk * tp1Rr : na)
+            if newStage == EXPIRED or newStage == INVALIDATED
+                if s.pool.status == 1
+                    s.pool.status := f_poolState(s.pool.status, false, false, true)
+                if not na(s.pendingMarker)
+                    label.delete(s.pendingMarker)
+                    s.pendingMarker := na
+                string detail = reason == "Entry filters rejected (consumed)" ? qualityReason : reason
+                latestRejected := "#" + str.tostring(s.id) + " " + detail
+                s.view.finished := true
+                s.view.finishedBar := bar_index
+                f_record(s.id, detail, close)
+                if debug
+                    f_label(s.view, d == 1 ? low : high, latestRejected, color.gray, false)
+
+    // Both directions can be active. Same-direction candidates are ignored
+    // while active. Simultaneous eligible entries consume both, signal neither.
+    bool conflict = array.get(proposed, 0) and array.get(proposed, 1)
+    for side = 0 to 1
+        if array.get(proposed, side)
+            Setup s = array.get(setups, side)
+            int d = s.direction
+            s.view.finished := true
+            s.view.finishedBar := bar_index
+            if conflict
+                s.stage := INVALIDATED
+                latestRejected := "Dual entry conflict (both consumed)"
+                f_record(s.id, "CONFLICT", close)
+            else
+                s.view.completed := true
+                buy := d == 1
+                sell := d == -1
+                lastTrade := Trade.new(s.id, d, bar_index, time_close, close, array.get(stops, side), array.get(tp1s, side), array.get(targets, side), barstate.isrealtime, barstate.isrealtime ? "Active" : "Historical", "Open")
+                f_record(s.id, "ENTRY_CONFIRMED", close)
+                color shade = d == 1 ? color.green : color.red
+                if showEntryLine
+                    f_line(s.view, bar_index, lastTrade.entry, bar_index + riskLineBars, color.silver, line.style_solid)
+                if showSl
+                    f_line(s.view, bar_index, lastTrade.stop, bar_index + riskLineBars, color.red, line.style_dashed)
+                if showTp
+                    if not na(lastTrade.tp1)
+                        f_line(s.view, bar_index, lastTrade.tp1, bar_index + riskLineBars, color.new(color.green, 40), line.style_dotted)
+                    f_line(s.view, bar_index, lastTrade.tp2, bar_index + riskLineBars, color.green, line.style_dashed)
+
+    // Only now register fresh pools. 'known' is the confirmation bar and
+    // origin is the historical pivot bar: eligibility is on a later candle.
+    if not na(externalHighPivot)
+        f_addPool(highPools, externalHighPivot, bar_index - externalLen, 2, "External", true, bar_index)
+    if not na(externalLowPivot)
+        f_addPool(lowPools, externalLowPivot, bar_index - externalLen, 2, "External", false, bar_index)
+    if internalPools and signalMode == "Aggressive"
+        if not na(internalHighPivot)
+            f_addPool(highPools, internalHighPivot, bar_index - internalLen, 1, "Internal", true, bar_index)
+        if not na(internalLowPivot)
+            f_addPool(lowPools, internalLowPivot, bar_index - internalLen, 1, "Internal", false, bar_index)
+    for sessionIndex = 0 to 1
+        bool enabled = sessionIndex == 0 ? useLondon : useNy
+        bool inside = enabled and (sessionIndex == 0 ? londonIn : nyIn)
+        bool wasOpen = array.get(sessionOpen, sessionIndex)
+        int key = sessionIndex == 0 ? londonKey : nyKey
+        if inside
+            if not wasOpen or key != array.get(sessionKeys, sessionIndex) or na(array.get(sessionHighs, sessionIndex))
+                array.set(sessionHighs, sessionIndex, high)
+                array.set(sessionLows, sessionIndex, low)
+                array.set(sessionHighOrigins, sessionIndex, bar_index)
+                array.set(sessionLowOrigins, sessionIndex, bar_index)
+            else
+                if high > array.get(sessionHighs, sessionIndex)
+                    array.set(sessionHighs, sessionIndex, high)
+                    array.set(sessionHighOrigins, sessionIndex, bar_index)
+                if low < array.get(sessionLows, sessionIndex)
+                    array.set(sessionLows, sessionIndex, low)
+                    array.set(sessionLowOrigins, sessionIndex, bar_index)
+        array.set(sessionOpen, sessionIndex, inside)
+        if inside
+            array.set(sessionKeys, sessionIndex, key)
+
+    if preserveHistory
+        int cleanupIndex = 0
+        while cleanupIndex < array.size(views)
+            View v = array.get(views, cleanupIndex)
+            bool doneUpdating = v.finished and (na(v.gap) or v.full or v.zoneExpired)
+            if doneUpdating
+                // Forget processing metadata without deleting chart objects.
+                array.remove(views, cleanupIndex)
+            else
+                cleanupIndex += 1
+    else
+        // Completed entries and incomplete attempts have separate budgets.
+        // Evict by FINISH time, not start time, so a long-waiting setup that
+        // just entered cannot be mistaken for an older completed trade.
+        int emptyIndex = 0
+        while emptyIndex < array.size(views)
+            View v = array.get(views, emptyIndex)
+            bool emptyFailed = v.finished and not v.completed and not debug and array.size(v.labels) == 0 and array.size(v.lines) == 0 and na(v.gap)
+            if emptyFailed
+                array.remove(views, emptyIndex)
+            else
+                emptyIndex += 1
+        for category = 0 to 1
+            bool completed = category == 0
+            int limit = completed ? historyLimit : failedHistoryLimit
+            int count = 0
+            for v in views
+                count += v.finished and v.completed == completed ? 1 : 0
+            while count > limit
+                int oldestIndex = -1
+                int oldestBar = na
+                for index = 0 to array.size(views) - 1
+                    View v = array.get(views, index)
+                    if v.finished and v.completed == completed and (na(oldestBar) or v.finishedBar < oldestBar)
+                        oldestIndex := index
+                        oldestBar := v.finishedBar
+                if oldestIndex >= 0
+                    f_deleteView(array.get(views, oldestIndex))
+                    array.remove(views, oldestIndex)
+                    count -= 1
+                else
+                    break
+        int boxCount = 0
+        for v in views
+            boxCount += not na(v.gap) ? 1 : 0
+        for v in views
+            if boxCount > maxZones and not na(v.gap)
+                box.delete(v.gap)
+                v.gap := na
+                boxCount -= 1
+
+// Single-position benchmark. Other indicator candidates while a trade is
+// open are deliberately untraded. Orders fill no earlier than next bar open.
+// SL/TP2 are fixed signal-time prices; TP1 is advisory, not a partial exit.
+if barstate.isconfirmed and strategy.position_size == 0
+    if buy
+        strategy.entry("Long", strategy.long)
+        strategy.exit("Long bracket", from_entry = "Long", stop = lastTrade.stop, limit = lastTrade.tp2)
+    else if sell
+        strategy.entry("Short", strategy.short)
+        strategy.exit("Short bracket", from_entry = "Short", stop = lastTrade.stop, limit = lastTrade.tp2)
+
+// Historical markers are plots, not drawing objects. TradingView retains
+// them on all loaded chart bars; object queues cannot erase these signals.
+plotshape(showEntries and buy ? low : na, "BUY history", shape.labelup, location.absolute, color.green, text = "BUY CAND", textcolor = color.white, size = size.normal)
+plotshape(showEntries and sell ? high : na, "SELL history", shape.labeldown, location.absolute, color.red, text = "SELL CAND", textcolor = color.white, size = size.normal)
+plotshape(preserveHistory and showSweeps and debug and bullPending and not bullSweep ? low : na, "Pending SSL history", shape.labelup, location.absolute, color.gray, text = "Pending", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showSweeps and debug and bearPending and not bearSweep ? high : na, "Pending BSL history", shape.labeldown, location.absolute, color.gray, text = "Pending", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showSweeps and debug and bullSweep ? low : na, "Confirmed SSL history", shape.labelup, location.absolute, color.green, text = "SSL", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showSweeps and debug and bearSweep ? high : na, "Confirmed BSL history", shape.labeldown, location.absolute, color.red, text = "BSL", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showSweeps and not debug and bullSweepRevealed ? low : na, "SSL to MSS history", shape.labelup, location.absolute, color.green, text = "Watch: SSL→MSS", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showSweeps and not debug and bearSweepRevealed ? high : na, "BSL to MSS history", shape.labeldown, location.absolute, color.red, text = "Watch: BSL→MSS", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showMss and bullMss and not bullChoch ? bullBreakPrice : na, "Bull MSS history", shape.labelup, location.absolute, color.green, text = "MSS", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showMss and bearMss and not bearChoch ? bearBreakPrice : na, "Bear MSS history", shape.labeldown, location.absolute, color.red, text = "MSS", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showMss and bullChoch ? bullBreakPrice : na, "Bull CHoCH history", shape.labelup, location.absolute, color.green, text = "CHoCH", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showMss and bearChoch ? bearBreakPrice : na, "Bear CHoCH history", shape.labeldown, location.absolute, color.red, text = "CHoCH", textcolor = color.white, size = size.tiny)
+plotshape(preserveHistory and showTriple and bullTriple ? low : na, "Bull triple history", shape.diamond, location.absolute, color.green, text = "Setup: Triple", textcolor = color.green, size = size.tiny)
+plotshape(preserveHistory and showTriple and bearTriple ? high : na, "Bear triple history", shape.diamond, location.absolute, color.red, text = "Setup: Triple", textcolor = color.red, size = size.tiny)
+
+// Hidden output plots also supply frozen risk values in entry alert messages.
+plot(lastTrade.entry, "Entry", display = display.none)
+plot(lastTrade.stop, "SL", display = display.none)
+plot(lastTrade.tp1, "TP1", display = display.none)
+plot(lastTrade.tp2, "TP2", display = display.none)
+plot(lastTrade.id, "Setup ID", display = display.none)
+f_stageName(int stage) =>
+    stage == SWEEP_PENDING ? "Sweep pending" : stage == SWEEP_CONFIRMED ? "Sweep" : stage == MSS_CONFIRMED ? "MSS" : stage == FVG_CONFIRMED ? "FVG" : stage == WAITING_RETEST ? "Retest" : stage == ENTRY_CONFIRMED ? "Entry" : stage == EXPIRED ? "Expired" : stage == INVALIDATED ? "Invalidated" : "Idle"
+f_price(float price) =>
+    na(price) ? "—" : str.tostring(price, format.mintick)
+var table dashboard = table.new(position.top_right, 2, 16, border_width = 1)
+if barstate.islast and showDashboard
+    Setup bull = array.get(setups, 0)
+    Setup bear = array.get(setups, 1)
+    bool bullActive = bull.stage >= SWEEP_PENDING and bull.stage <= WAITING_RETEST
+    bool bearActive = bear.stage >= SWEEP_PENDING and bear.stage <= WAITING_RETEST
+    Setup current = bearActive and (not bullActive or bear.id > bull.id) ? bear : bull
+    bool hasCurrent = bullActive or bearActive
+    bool entryNow = lastTrade.id > 0 and lastTrade.entered == bar_index
+    string direction = bullActive and bearActive ? "Both (newest below)" : bullActive ? "Bullish" : bearActive ? "Bearish" : entryNow ? (lastTrade.direction == 1 ? "Bullish" : "Bearish") : "None"
+    array<string> names = array.from("SMTC V3 TEST", "HTF structure", "Current setup", "Setup stage", "Setup age", "Latest sweep level", "Latest MSS level", "Active FVG", "Last entry", "Entry timestamp", "Entry status", "Latest rejection", "Effective HTF", "Protected HTF level", "Latest net R / room R", "Latest entry check")
+    string activeGap = hasCurrent and current.stage == WAITING_RETEST ? f_price(current.bottom) + " – " + f_price(current.top) : "None"
+    string lastDirection = lastTrade.direction == 1 ? "BUY" : lastTrade.direction == -1 ? "SELL" : "None"
+    array<string> values = array.from(signalMode + " / " + comparisonMode, htfBias == 1 ? "Bullish" : htfBias == -1 ? "Bearish" : "Neutral", direction, hasCurrent ? (current.stage == WAITING_RETEST and current.gapBar == bar_index ? "FVG → Retest" : f_stageName(current.stage)) + " #" + str.tostring(current.id) : entryNow ? "Entry #" + str.tostring(lastTrade.id) : "None", hasCurrent ? str.tostring(bar_index - current.start) + " bars" : "—", f_price(latestSweepPrice), f_price(latestMssPrice), activeGap, lastDirection + " " + f_price(lastTrade.entry), na(lastTrade.timestamp) ? "—" : str.format_time(lastTrade.timestamp, "yyyy-MM-dd HH:mm", dashboardTimezone), lastTrade.id == 0 ? "None" : lastTrade.status + " • " + lastTrade.outcome, latestRejected, biasTf + (htfFilter ? " enabled" : " disabled"), f_price(htfProtected), (na(lastNetR) ? "—" : str.tostring(lastNetR, "#.##")) + " / " + (na(lastRoomR) ? "—" : str.tostring(lastRoomR, "#.##")), lastQuality)
+    for row = 0 to 15
+        table.cell(dashboard, 0, row, array.get(names, row), text_color = color.silver, bgcolor = color.new(color.black, 20))
+        table.cell(dashboard, 1, row, array.get(values, row), text_color = color.white, bgcolor = color.new(color.black, 20))
